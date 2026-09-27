@@ -73,7 +73,8 @@ class YandexMusicBaseIE(InfoExtractor):
         return base64.b64encode(digest).decode().rstrip('=')
 
     def _current_hmac_key(self):
-        pinned = self._configuration_arg('hmac_key', [None], ie_key='YandexMusic')[0]
+        pinned = self._configuration_arg(
+            'hmac_key', [None], ie_key='YandexMusic', casesense=True)[0]
         if pinned:
             return pinned
         if self._KEY_CACHE['key']:
@@ -190,49 +191,62 @@ class YandexMusicBaseIE(InfoExtractor):
             download_info.get('url')
             or traverse_obj(download_info, ('urls', 0, {str})))
 
+    def _refresh_hmac_key(self):
+        if self._configuration_arg(
+                'hmac_key', [None], ie_key='YandexMusic', casesense=True)[0]:
+            raise ExtractorError(
+                'Yandex Music signing key rejected. Update hmac_key via '
+                '--extractor-args "yandexmusic:hmac_key=..."',
+                expected=True)
+        if self._KEY_CACHE.get('refresh_failed'):
+            raise ExtractorError(
+                'Yandex Music signing key rejected and could not be refreshed. '
+                'Pass a fresh key with --extractor-args "yandexmusic:hmac_key=..."',
+                expected=True)
+        old_key = self._current_hmac_key()
+        new_key = self._fetch_key_from_frontend()
+        if new_key and new_key != old_key:
+            self._save_hmac_key(new_key)
+            self.report_warning(
+                f'Yandex Music signing key refreshed to {new_key!r}')
+            return
+        self._KEY_CACHE['refresh_failed'] = True
+        raise ExtractorError(
+            'Yandex Music signing key rejected and could not be refreshed',
+            expected=True)
+
     def _extract_formats(self, track_id):
         download_info = None
         last_err = None
+        key_refreshed = False
         for quality in ('lossless', 'nq'):
             try:
                 download_info = self._get_file_info(track_id, quality)
                 break
             except ExtractorError as e:
                 last_err = e
-                if str(e) != 'not-allowed':
-                    if quality == 'nq':
-                        raise
-                    self.report_warning(
-                        f'Track {track_id}: {quality} unavailable, trying fallback ({e})')
-                    continue
-                # Signature rejected — refresh key from frontend once.
-                if self._configuration_arg('hmac_key', [None], ie_key='YandexMusic')[0]:
-                    raise ExtractorError(
-                        'Yandex Music signing key rejected. Update hmac_key via '
-                        '--extractor-args "yandexmusic:hmac_key=..."',
-                        expected=True)
-                if self._KEY_CACHE.get('refresh_failed'):
-                    raise ExtractorError(
-                        'Yandex Music signing key rejected and could not be refreshed. '
-                        'Pass a fresh key with --extractor-args "yandexmusic:hmac_key=..."',
-                        expected=True)
-                old_key = self._current_hmac_key()
-                new_key = self._fetch_key_from_frontend()
-                if new_key and new_key != old_key:
-                    self._save_hmac_key(new_key)
-                    self.report_warning(
-                        f'Yandex Music signing key refreshed to {new_key!r}')
-                    try:
-                        download_info = self._get_file_info(track_id, quality)
-                        break
-                    except ExtractorError:
+                if str(e) == 'not-allowed':
+                    if key_refreshed:
                         raise ExtractorError(
                             'Yandex Music signing key still rejected after refresh',
                             expected=True)
-                self._KEY_CACHE['refresh_failed'] = True
-                raise ExtractorError(
-                    'Yandex Music signing key rejected and could not be refreshed',
-                    expected=True) from last_err
+                    self._refresh_hmac_key()
+                    key_refreshed = True
+                    try:
+                        download_info = self._get_file_info(track_id, quality)
+                        break
+                    except ExtractorError as retry_err:
+                        last_err = retry_err
+                        if str(retry_err) == 'not-allowed':
+                            raise ExtractorError(
+                                'Yandex Music signing key still rejected after refresh',
+                                expected=True)
+                        # Non-signature failure after refresh — try next quality.
+                if quality == 'nq':
+                    raise last_err
+                self.report_warning(
+                    f'Track {track_id}: {quality} unavailable, trying fallback ({last_err})')
+                continue
 
         if not download_info:
             raise last_err or ExtractorError(
@@ -365,27 +379,41 @@ class YandexMusicTrackIE(YandexMusicBaseIE):
 
 class YandexMusicPlaylistBaseIE(YandexMusicBaseIE):
     def _resolve_tracks(self, tracks, item_id):
-        full, missing = [], []
-        for entry in tracks:
+        """Resolve playlist entries to full track dicts, preserving order."""
+        result = [None] * len(tracks)
+        missing_ids = []
+        missing_indices = []
+        for i, entry in enumerate(tracks):
             track = entry.get('track') if isinstance(entry, dict) else None
             if track:
-                full.append(track)
+                result[i] = track
                 continue
-            track_id = str_or_none(entry.get('id') if isinstance(entry, dict) else entry)
+            track_id = str_or_none(
+                entry.get('id') if isinstance(entry, dict) else entry)
             if track_id:
-                missing.append(track_id)
+                missing_ids.append(track_id)
+                missing_indices.append(i)
 
+        resolved_by_id = {}
         for start in itertools.count(0, 250):
-            chunk = missing[start:start + 250]
+            chunk = missing_ids[start:start + 250]
             if not chunk:
                 break
             resolved = self._call_api(
                 'tracks', item_id, f'Downloading tracks JSON ({start + len(chunk)})',
                 data=f'track-ids={",".join(chunk)}'.encode(),
                 headers={'Content-Type': 'application/x-www-form-urlencoded'})
-            if resolved:
-                full.extend(resolved)
-        return full
+            for track in resolved or []:
+                track_id = str_or_none(track.get('id') or track.get('realId'))
+                if track_id and track_id not in resolved_by_id:
+                    resolved_by_id[track_id] = track
+
+        for idx, track_id in zip(missing_indices, missing_ids):
+            track = resolved_by_id.get(track_id)
+            if track:
+                result[idx] = track
+
+        return [track for track in result if track]
 
     def _build_playlist(self, tracks):
         for track in tracks:
