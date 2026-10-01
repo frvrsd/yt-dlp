@@ -2344,6 +2344,7 @@ from .yandexmusic import (
     YandexMusicArtistAlbumsIE,
     YandexMusicArtistTracksIE,
     YandexMusicPlaylistIE,
+    YandexMusicSharedPlaylistIE,
     YandexMusicTrackIE,
 )
 from .yandexvideo import (

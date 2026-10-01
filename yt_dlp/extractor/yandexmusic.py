@@ -498,6 +498,44 @@ class YandexMusicPlaylistIE(YandexMusicPlaylistBaseIE):
             playlist.get('title'), playlist.get('description'))
 
 
+class YandexMusicSharedPlaylistIE(YandexMusicPlaylistBaseIE):
+    IE_NAME = 'yandexmusic:shared_playlist'
+    IE_DESC = 'Яндекс.Музыка - Общий плейлист'
+    # /playlists/<uuid>, /playlists/lk.<uuid>, /playlists/pl.<uuid>, /playlists/ch.<uuid>
+    _VALID_URL = (
+        rf'{YandexMusicBaseIE._VALID_URL_BASE}/playlists/'
+        rf'(?P<id>(?:(?:lk|pl|ch)\.)?[0-9a-fA-F-]{{36}})')
+
+    _TESTS = [{
+        'url': 'https://music.yandex.ru/playlists/96a4e684-6670-ab96-a6ff-2e2d07fc1160',
+        'info_dict': {
+            'id': '96a4e684-6670-ab96-a6ff-2e2d07fc1160',
+            'title': 'Вечные хиты',
+        },
+        'playlist_mincount': 1,
+        'skip': 'Requires Yandex Music cookies (--cookies)',
+    }, {
+        'url': 'https://music.yandex.ru/playlists/96a4e684-6670-ab96-a6ff-2e2d07fc1160?utm_source=web&utm_medium=copy_link',
+        'only_matching': True,
+    }]
+
+    def _real_extract(self, url):
+        playlist_uuid = self._match_id(url)
+        playlist = self._call_api(
+            f'playlist/{playlist_uuid}', playlist_uuid,
+            'Downloading shared playlist JSON')
+        if not playlist:
+            raise ExtractorError(f'Playlist {playlist_uuid} not found', expected=True)
+        if playlist.get('available') is False:
+            raise ExtractorError(
+                f'Playlist {playlist_uuid} is not available', expected=True)
+
+        tracks = self._resolve_tracks(playlist.get('tracks') or [], playlist_uuid)
+        return self.playlist_result(
+            self._build_playlist(tracks), playlist_uuid,
+            playlist.get('title'), playlist.get('description'))
+
+
 class YandexMusicArtistBaseIE(YandexMusicPlaylistBaseIE):
     def _artist_name(self, artist_id):
         return traverse_obj(self._call_api(
